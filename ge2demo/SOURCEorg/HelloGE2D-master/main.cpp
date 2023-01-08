@@ -1,0 +1,228 @@
+#include <fcntl.h>
+#include <stdio.h>
+#include <unistd.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/mman.h>
+#include <stdbool.h>
+#include <sys/ioctl.h>
+#include <linux/fb.h>
+
+#include "ge2d.h"
+
+// RGBA colors
+const int BLUE = 0x0000ffff;
+const int RED = 0xff0000ff;
+const int BLACK = 0x000000ff;
+
+// Test pattern sizes
+const int testWidth = 256;
+const int testHeight = 256;
+const int testLength = testWidth * testHeight * 4; // 4 bytes per pixel
+
+// /dev/fb1 memory location from dmesg output
+// mesonfb1(low)           : 0x07900000 - 0x07a00000 (1M)
+#const unsigned long physicalAddress = 0x07900000;
+##fb: reserved memory base:0x000000007f800000, size:800000
+#fb1 starts at 80000000
+#const unsigned long physicalAddress = 0x55400000
+const unsigned long physicalAddress = 0x0000000080000000
+
+void CreateTestPattern()
+{
+    // The GE2D hardware only works with physically contiguous bus addresses.
+    // Only the kernel or a driver can provide this type of memory.  Instead of
+    // including a kernel driver, this code borrows memory from /dev/fb1.  This
+    // makes the code fragile and prone to breakage should the kernel change.
+    // Production code should use the kernel CMA allocator instead.
+
+
+    // Borrow physical memory from /dev/fb1
+    // Must be root
+    int fd = open("/dev/mem", O_RDWR | O_SYNC);
+    if (fd < 0)
+    {
+        printf("Can't open /dev/mem (%x)\n", fd);
+        exit(1);
+    }
+
+    int* data = (int*) mmap(0, testLength, PROT_READ|PROT_WRITE, MAP_SHARED, fd, physicalAddress);
+    if (data == NULL)
+    {
+        printf("Can't mmap\n");
+        exit(1);
+    }
+
+    printf("virtual address = %x\n", data);
+
+
+    // Create a checkerboard in memory
+    int x;
+    int y;
+
+    for (y = 0; y < testHeight; ++y)
+    {
+        for (x = 0; x < testWidth; ++x)
+        {
+            int color;
+            bool renderFlag;
+
+            if ((x & 0x20) == 0)
+            {
+                renderFlag = true;
+            }
+            else
+            {
+                renderFlag = false;
+            }
+
+            if ((y & 0x20) == 0)
+            {
+                renderFlag = !renderFlag;
+            }
+
+            if (renderFlag)
+            {
+                color = RED; //RGBA
+            }
+            else
+            {
+                color = BLACK;
+            }
+
+            data[y * testWidth + x] = color;
+        }
+    }
+    printf("Pattern created OK\n");
+
+    // Clean up
+    munmap(data, testLength);
+    close(fd);
+    printf("munmap and close OK\n");
+}
+
+
+
+void FillRectangle(int fd_ge2d, int x, int y, int width, int height, int color)
+{
+    // Tell the hardware the destination is /dev/fb0
+    config_para_t config;
+    memset(&config, 0x00, sizeof(config));
+
+    config.src_dst_type = OSD0_OSD0;
+
+    int ret = ioctl(fd_ge2d, GE2D_CONFIG, &config);
+    printf("GE2D_CONFIG ret: %x\n", ret);
+
+
+    // Perform a fill operation;
+    ge2d_para_t fillRectParam;
+    fillRectParam.src1_rect.x = x;
+    fillRectParam.src1_rect.y = y;
+    fillRectParam.src1_rect.w = width;
+    fillRectParam.src1_rect.h = height;
+    fillRectParam.color = color; // R G B A
+
+    ret = ioctl(fd_ge2d, GE2D_FILLRECTANGLE, &fillRectParam);
+    printf("GE2D_FILLRECTANGLE ret: %x\n", ret);
+}
+
+
+
+void BlitTestPattern(int fd_ge2d, int dstX, int dstY, int screenWidth, int screenHeight)
+{
+    // Tell the hardware we will source memory (that we borrowed)
+    // and write to /dev/fb0
+
+    // This shows the expanded form of config.  Using this expanded
+    // form allows the blit source x and y read directions to be specified
+    // as well as the destination x and y write directions.  Together
+    // they allow overlapping blit operations to be performed.
+    config_para_ex_t configex;
+    memset(&configex, 0x00, sizeof(configex));
+
+    configex.src_para.mem_type = CANVAS_ALLOC;
+    configex.src_para.format = GE2D_FORMAT_S32_RGBA;
+    configex.src_planes[0].addr = (unsigned long)physicalAddress;
+    configex.src_planes[0].w = testWidth;
+    configex.src_planes[0].h = testHeight;
+    configex.src_para.left = 0;
+    configex.src_para.top = 0;
+    configex.src_para.width = testWidth;
+    configex.src_para.height = testHeight;
+    configex.src_para.x_rev = 0;
+    configex.src_para.y_rev = 0;
+
+    configex.src2_para.mem_type = CANVAS_TYPE_INVALID;
+
+    configex.dst_para.mem_type = CANVAS_OSD0;
+    configex.dst_para.left = 0;
+    configex.dst_para.top = 0;
+    configex.dst_para.width = screenWidth;
+    configex.dst_para.height = screenHeight;
+    configex.dst_para.x_rev = 0;
+    configex.dst_para.y_rev = 0;
+
+
+    int ret = ioctl(fd_ge2d, GE2D_CONFIG_EX, &configex);
+    printf("GE2D_CONFIG_EX ret: %x\n", ret);
+
+
+    // Perform the blit operation
+    ge2d_para_t blitRectParam2;
+    memset(&blitRectParam2, 0, sizeof(blitRectParam2));
+
+    blitRectParam2.src1_rect.x = 0;
+    blitRectParam2.src1_rect.y = 0;
+    blitRectParam2.src1_rect.w = testWidth;
+    blitRectParam2.src1_rect.h = testHeight;
+    blitRectParam2.dst_rect.x = dstX;
+    blitRectParam2.dst_rect.y = dstY;
+
+    ret = ioctl(fd_ge2d, GE2D_BLIT, &blitRectParam2);
+    printf("GE2D_BLIT ret: %x\n", ret);
+}
+
+int main()
+{
+    int fd_ge2d = open("/dev/ge2d", O_RDWR);
+    if (fd_ge2d < 0)
+    {
+        printf("Can't open /dev/ge2d\n");
+        exit(1);
+    }
+
+    // Get the screen height and width
+    int fbfd = open("/dev/fb0", O_RDWR);
+    if (fbfd == -1) {
+        printf("Can't open framebuffer device\n");
+        exit(1);
+    }
+
+    struct fb_var_screeninfo vinfo;
+    if (ioctl(fbfd, FBIOGET_VSCREENINFO, &vinfo) == -1) {
+        perror("Error reading variable information\n");
+        exit(1);
+    }
+
+    close(fbfd);
+
+    int screenWidth = vinfo.xres;
+    int screenHeight = vinfo.yres;
+
+    printf("Screen size = %d x %d\n", screenWidth, screenHeight);
+
+
+
+    CreateTestPattern();
+
+    FillRectangle(fd_ge2d, 0, 0, 512, 512, BLUE); // RGBA
+
+    BlitTestPattern(fd_ge2d, 128, 128, screenWidth, screenHeight);
+
+
+
+    close(fd_ge2d);
+
+    return 0;
+}
